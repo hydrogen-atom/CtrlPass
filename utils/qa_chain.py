@@ -1,191 +1,131 @@
-from typing import List, Dict, Optional
-from langchain.chains import ConversationalRetrievalChain
-from langchain_community.chat_models import QianfanChatEndpoint
-from langchain.memory import ConversationBufferMemory
-from .knowledge_base import KnowledgeBase
+import time
+from typing import Any, Optional
+
+import requests
+
+from utils.vector_store import RetrievalStrategy
+
 
 class QAChain:
-    def __init__(self, qianfan_api_key: str, qianfan_secret_key: str):
-        """
-        初始化QA链
-        Args:
-            qianfan_api_key: 通义千问 API Key
-            qianfan_secret_key: 通义千问 Secret Key
-        """
-        self.knowledge_base = KnowledgeBase()
-        
-        # 初始化LLM
-        self.llm = QianfanChatEndpoint(
-            model="qianfan-chinese-llama-2-7b",
-            temperature=0.7,
-            qianfan_ak=qianfan_api_key,
-            qianfan_sk=qianfan_secret_key
-        )
-        
-        # 初始化对话记忆
-        self.memory = ConversationBufferMemory(
-            memory_key="chat_history",
-            return_messages=True
-        )
-        
-        # 初始化QA链
-        self.qa_chain = None
-        
-        # 问题类型提示模板
-        self.question_type_prompts = {
-            "factual": """请基于以下文档内容回答问题，同时可以结合你的知识进行补充说明。
-            1. 首先使用文档中明确提到的信息作为主要依据
-            2. 如果文档信息不足，可以补充你的相关知识
-            3. 如果使用了自己的知识，请明确标注"补充说明："
-            4. 确保回答准确、完整、有深度""",
-            
-            "inferential": """请基于以下文档内容进行推理分析，并结合你的知识进行深入解读。
-            1. 使用文档内容作为推理的基础
-            2. 结合你的知识进行合理的延伸和解释
-            3. 区分文档中的信息和你的推理
-            4. 提供有深度的分析和见解""",
-            
-            "summary": """请对以下文档内容进行总结，并加入你的专业见解。
-            1. 提取文档中的关键信息
-            2. 补充相关的背景知识
-            3. 提供专业的分析和建议
-            4. 确保总结全面且有深度""",
-            
-            "comparison": """请比较以下文档内容中的不同观点或方法，并加入你的专业分析。
-            1. 基于文档内容进行对比
-            2. 补充相关的专业知识和经验
-            3. 提供深入的分析和见解
-            4. 给出专业的建议和结论""",
-            
-            "definition": """请解释以下文档内容中的概念或术语，并补充相关知识。
-            1. 使用文档中的定义作为基础
-            2. 补充相关的专业解释和例子
-            3. 提供更广泛的应用场景
-            4. 确保解释准确且易于理解""",
-            
-            "procedural": """请详细说明以下文档内容中描述的过程或步骤，并补充最佳实践。
-            1. 基于文档内容描述基本流程
-            2. 补充相关的专业经验和技巧
-            3. 提供实用的建议和注意事项
-            4. 确保说明清晰且可操作""",
-            
-            "opinion": """请分析以下文档内容中的观点和论证，并提供专业的见解。
-            1. 基于文档内容分析主要观点
-            2. 补充相关的专业知识和经验
-            3. 提供深入的分析和评价
-            4. 给出专业的建议和结论"""
+    def __init__(
+        self,
+        qwen_api_key: str,
+        vector_store: Any,
+        finetuned_model_path: Optional[str] = None,
+        use_enhanced_retrieval: bool = True,
+        retrieval_strategy: Optional[RetrievalStrategy] = None,
+    ):
+        self.api_key = qwen_api_key
+        self.vector_store = vector_store
+        self.use_enhanced_retrieval = use_enhanced_retrieval
+        self.retrieval_strategy = retrieval_strategy
+        self.url = "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation"
+        self.headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
         }
-    
-    def add_document(self, file_path: str) -> Dict:
-        """
-        添加文档到知识库
-        Args:
-            file_path: 文档路径
-        Returns:
-            Dict: 添加结果信息
-        """
-        return self.knowledge_base.add_document(file_path)
-    
-    def _create_qa_chain(self):
-        """创建QA链"""
-        if self.knowledge_base.vectorstore is None:
-            return None
-        
-        return ConversationalRetrievalChain.from_llm(
-            llm=self.llm,
-            retriever=self.knowledge_base.vectorstore.as_retriever(
-                search_kwargs={
-                    "k": 4,
-                    "score_threshold": 0.7  # 设置相似度阈值
-                }
-            ),
-            memory=self.memory,
-            return_source_documents=True,
-            combine_docs_chain_kwargs={
-                "prompt": self._get_qa_prompt()
-            }
-        )
-    
-    def _get_qa_prompt(self, question_type: str = "factual") -> str:
-        """获取问答提示模板"""
-        base_prompt = self.question_type_prompts.get(question_type, self.question_type_prompts["factual"])
-        return f"""
-        {base_prompt}
-        
-        文档内容：
-        {{context}}
-        
-        问题：{{question}}
-        
-        请基于文档内容回答问题，同时可以结合你的知识进行补充说明。
-        回答时请：
-        1. 首先引用相关的文档内容作为支持
-        2. 然后可以补充你的专业知识和见解
-        3. 如果使用了自己的知识，请明确标注"补充说明："
-        4. 确保回答准确、完整、有深度
-        """
-    
-    def answer_question(self, question: str, question_type: str = "factual") -> Dict:
-        """
-        回答问题
-        Args:
-            question: 问题
-            question_type: 问题类型
-        Returns:
-            Dict: 回答结果
-        """
-        # 如果知识库为空，重新添加文档
-        if self.knowledge_base.vectorstore is None:
-            return {
-                "status": "error",
-                "message": "知识库为空，请先添加文档"
-            }
-        
-        # 创建或获取QA链
-        if self.qa_chain is None:
-            self.qa_chain = self._create_qa_chain()
-            if self.qa_chain is None:
-                return {
-                    "status": "error",
-                    "message": "无法创建QA链"
-                }
-        
+
+        self.use_finetuned = finetuned_model_path is not None
+        if self.use_finetuned:
+            import torch
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+            print(f"Loading finetuned model from {finetuned_model_path}...")
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                finetuned_model_path,
+                trust_remote_code=True,
+            )
+            self.model = AutoModelForCausalLM.from_pretrained(
+                finetuned_model_path,
+                trust_remote_code=True,
+                device_map="auto",
+                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
+            )
+            print("Finetuned model loaded.")
+
+    def _build_context(self, question: str, strategy: Optional[RetrievalStrategy] = None) -> str:
+        strategy = strategy or self.retrieval_strategy
+        if hasattr(self.vector_store, "build_context"):
+            return self.vector_store.build_context(
+                question,
+                use_enhanced=self.use_enhanced_retrieval,
+                max_tokens=1500,
+                strategy=strategy,
+            )
+
+        documents = self.vector_store.similarity_search(question, k=5)
+        return "\n".join(doc.page_content for doc in documents)
+
+    def _build_prompt(self, question: str, context: str) -> str:
+        return f"""你是一位经验丰富的学习助手。以下是本次考试的复习资料。请根据这些复习资料回答问题，并给出相关复习建议。
+如果参考信息中没有相关内容，请根据现有知识给出合理回答，并明确说明该信息未在复习资料中找到。
+
+参考信息：
+{context}
+
+问题：{question}
+
+回答："""
+
+    def get_answer(self, question: str, context_override: Optional[str] = None) -> str:
+        """Get an answer for the provided question."""
         try:
-            # 更新提示模板
-            self.qa_chain.combine_docs_chain.llm_chain.prompt = self._get_qa_prompt(question_type)
-            
-            # 执行问答
-            result = self.qa_chain({"question": question})
-            
-            # 格式化结果
-            return {
-                "status": "success",
-                "answer": result["answer"],
-                "sources": [
-                    {
-                        "content": doc.page_content,
-                        "metadata": doc.metadata,
-                        "relevance_score": doc.metadata.get("score", 0)
-                    }
-                    for doc in result["source_documents"]
-                ]
-            }
-            
-        except Exception as e:
-            return {
-                "status": "error",
-                "message": f"回答问题时出错: {str(e)}"
-            }
-    
-    def clear_memory(self):
-        """清除对话记忆"""
-        self.memory.clear()
-        self.qa_chain = None
-    
-    def get_stats(self) -> Dict:
-        """
-        获取统计信息
-        Returns:
-            Dict: 统计信息
-        """
-        return self.knowledge_base.get_stats() 
+            print(f"Processing question: {question}")
+            start_time = time.time()
+
+            if context_override is not None:
+                context = context_override
+            else:
+                strategy = getattr(self, "retrieval_strategy", None)
+                context = self._build_context(question, strategy=strategy)
+            prompt = self._build_prompt(question, context)
+
+            if self.use_finetuned:
+                inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+                outputs = self.model.generate(
+                    **inputs,
+                    max_length=2048,
+                    temperature=0.2,
+                    top_p=0.8,
+                    top_k=50,
+                    repetition_penalty=1.1,
+                    do_sample=True,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                )
+                answer = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+                answer = answer[len(prompt):].strip()
+            else:
+                payload = {
+                    "model": "qwen-turbo",
+                    "input": {"prompt": prompt},
+                    "parameters": {
+                        "temperature": 0.4,
+                        "max_tokens": 800,
+                    },
+                }
+
+                response = requests.post(
+                    self.url,
+                    headers=self.headers,
+                    json=payload,
+                    timeout=60,
+                )
+                response_data = response.json()
+
+                if response.status_code == 200:
+                    answer = response_data.get("output", {}).get("text", "无法获取回答")
+                else:
+                    error_msg = f"API 调用失败: {response.status_code} - {response.text}"
+                    print(error_msg)
+                    return error_msg
+
+            elapsed = time.time() - start_time
+            print(f"Question processed in {elapsed:.2f}s")
+            return answer
+
+        except Exception as exc:
+            error_msg = f"获取答案时出错: {exc}"
+            print(error_msg)
+            return error_msg

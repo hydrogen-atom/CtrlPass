@@ -13,7 +13,7 @@ class ExerciseGenerator:
         logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger(__name__)
         
-        self.exercise_template = """基于以下学习资料，生成3道练习题。每道题应该包含：
+        self.exercise_template = """假如你是出题者，模仿以下学习资料的出题风格和考察知识点，生成3道练习题。每道题应该包含：
         1. 题目描述
         2. 选项（如果是选择题）
         3. 正确答案
@@ -37,7 +37,7 @@ class ExerciseGenerator:
         """
 
     def generate_exercises(self, content: str) -> List[Dict]:
-        """生成练习题"""
+        
         try:
             if not content or not content.strip():
                 self.logger.error("错误：文档内容为空")
@@ -60,12 +60,11 @@ class ExerciseGenerator:
                 max_tokens=2000,
                 top_p=0.8,
                 top_k=50,
-                enable_search=True,
-                incremental_output=False
+                enable_search=True
             )
             
-            self.logger.info(f"API响应状态码: {response.status_code}")
-            self.logger.info(f"API响应类型: {type(response)}")
+           # self.logger.info(f"API响应状态码: {response.status_code}")
+            #self.logger.info(f"API响应类型: {type(response)}")
             
             if response.status_code == 200:
                 # 从响应中提取JSON内容
