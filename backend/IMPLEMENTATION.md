@@ -26,6 +26,7 @@ python backend/app.py
 | `database.py` | SQLite 连接、UTC 时间、事务、数据库初始化 |
 | `practice.py` | 登录、所属用户验证、资料、题目、计时、提交、提示、错因接口 |
 | `learning_provider.py` | 调用现有文档、向量和模型组件 |
+| `study_agent.py` | LangGraph 的观察、决策、工具执行和再观察循环 |
 | `app.py` | Flask 启动和原有问答接口的账号适配 |
 | `frontend/src/components/PracticeApp.tsx` | 登录、资料、做题、提示、历史、错因确认页面 |
 | `tests/test_practice_lifecycle.py` | 使用真实 SQLite 和固定模型返回值的离线验收测试 |
@@ -70,6 +71,9 @@ python backend/app.py
 | POST | `/api/materials/{id}/process` | `chunk_size?,chunk_overlap?,use_model_splitter?` |
 | PATCH | `/api/materials/{id}/knowledge-points/{point_id}` | `name` |
 | POST | `/api/questions/generate` | `material_id,primary_knowledge_point_id,question_type?,difficulty_level?,goal?` |
+| POST | `/api/agent/run` | `material_id,task?,goal?`，任务支持 `auto/practice/qa/knowledge_graph` |
+| POST | `/api/materials/{id}/ask` | `question`，检索资料后回答并返回来源片段 |
+| POST | `/api/materials/{id}/knowledge-graph` | `focus?`，生成带来源的节点与关系 |
 | GET | `/api/questions/{id}` | 题干与选项，不返回标准答案或评分标准 |
 | POST | `/api/questions/{id}/attempts` | `{is_page_hidden:0}`，已有进行中作答时返回该记录 |
 | PATCH | `/api/attempts/{id}/progress` | 下方进度对象 |

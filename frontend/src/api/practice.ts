@@ -9,6 +9,20 @@ export interface Question {
   question_type: string; question: string; options: { id: string; text: string }[];
   difficulty_level: number; question_summary: string;
 }
+export interface AgentTraceEvent {
+  phase: 'observe' | 'decide' | 'act'; step: number; action?: string; summary: string;
+}
+export interface AgentResult {
+  goal: string; message: string; tool_steps: number; trace: AgentTraceEvent[];
+}
+export interface SourceRef { chunk_id: number; page: number | null }
+export interface GraphNode { id: string; label: string; category: string; description: string }
+export interface GraphEdge { source: string; target: string; relation: string; evidence: string }
+export interface KnowledgeGraph { nodes: GraphNode[]; edges: GraphEdge[]; source_refs: SourceRef[] }
+export type AgentOutput =
+  | { type: 'practice'; question: Question; reused?: boolean }
+  | { type: 'qa'; answer: string; source_refs: SourceRef[]; reused?: boolean }
+  | { type: 'knowledge_graph'; graph: KnowledgeGraph; reused?: boolean };
 export interface Attempt {
   id: number; question_id: number; attempt_no: number; status: string;
   started_at: string; submitted_at: string | null; updated_at: string;

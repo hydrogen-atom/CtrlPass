@@ -21,6 +21,23 @@ class FakeProvider:
     fail_grade = False
     fail_hint = False
 
+    def decide_next(self, goal, observation, trace, has_result):
+        self.agent_observations = getattr(self, 'agent_observations', []) + [observation]
+        if has_result:
+            return dict(action='finish', arguments={}, reason='已观察到目标结果生成成功。', final_message='已根据资料完成任务。')
+        if observation.get('requested_task') == 'qa':
+            return dict(action='answer_from_material', arguments={'question': goal}, reason='用户需要资料问答。', final_message='')
+        if observation.get('requested_task') == 'knowledge_graph':
+            return dict(action='generate_knowledge_graph', arguments={'focus': goal}, reason='用户需要梳理知识关系。', final_message='')
+        if 'point_stats' not in observation:
+            return dict(action='inspect_learning_history', arguments={}, reason='先比较各知识点的历史表现。', final_message='')
+        return dict(action='generate_practice_question', arguments={
+            'primary_knowledge_point_id': 1,
+            'question_type': 'single_choice',
+            'difficulty_level': 3,
+            'focus': '巩固二分查找的前置条件',
+        }, reason='知识点一需要继续巩固。', final_message='')
+
     def process(self, material, config, root):
         return dict(chunk_count=3, vector_store_path=f'materials/{material["id"]}/vectors', knowledge_points=['二分查找', '边界条件'])
 
@@ -40,6 +57,21 @@ class FakeProvider:
         if self.fail_hint:
             raise RuntimeError('Simulated hint outage')
         return '想一想如何排除一半的候选范围。'
+
+    def answer(self, material, question, root):
+        return {'answer': '二分查找要求数据有序。[片段1]', 'source_refs': [{'chunk_id': 1, 'page': None}]}
+
+    def knowledge_graph(self, material, focus, root):
+        return {
+            'nodes': [
+                {'id': 'binary-search', 'label': '二分查找', 'category': '算法', 'description': '逐步缩小范围'},
+                {'id': 'sorted-data', 'label': '有序数据', 'category': '前提', 'description': '数据保持有序'},
+            ],
+            'edges': [
+                {'source': 'binary-search', 'target': 'sorted-data', 'relation': '要求', 'evidence': '二分查找依赖有序数据'},
+            ],
+            'source_refs': [{'chunk_id': 1, 'page': None}],
+        }
 
 
 class PracticeTests(unittest.TestCase):
@@ -105,6 +137,58 @@ class PracticeTests(unittest.TestCase):
         self.assertTrue(all('INTEGER PRIMARY KEY AUTOINCREMENT' in t['sql'] for t in tables))
         with self.assertRaises(sqlite3.IntegrityError):
             self.sql("INSERT INTO learning_materials(user_id,original_filename,file_type,file_size,file_path,content_hash,created_at) VALUES(999,'x','txt',1,'x','x','x')")
+
+    def test_agent_observes_decides_calls_tools_and_observes_again(self):
+        mid = self.material()
+        response = self.post('/agent/run', dict(material_id=mid, goal='安排下一道练习'))
+        self.assertEqual(response.status_code, 201, response.json)
+        self.assertNotIn('answer', response.json['question'])
+        self.assertEqual(response.json['agent']['tool_steps'], 2)
+        phases = [event['phase'] for event in response.json['agent']['trace']]
+        self.assertEqual(phases, ['observe', 'decide', 'act', 'observe', 'decide', 'act', 'observe', 'decide'])
+        self.assertNotIn('point_stats', self.provider.agent_observations[0])
+        self.assertIn('point_stats', self.provider.agent_observations[1])
+        self.assertEqual(self.provider.agent_observations[2]['question']['id'], response.json['question']['id'])
+        saved = self.sql('SELECT generation_context_json FROM questions WHERE id=?', (response.json['question']['id'],))[0]
+        self.assertTrue(json.loads(saved['generation_context_json'])['agent_mode'])
+
+    def test_agent_rejects_unknown_model_selected_tool(self):
+        mid = self.material()
+        with patch.object(self.provider, 'decide_next', return_value={
+            'action': 'delete_material', 'arguments': {}, 'reason': 'bad', 'final_message': '',
+        }):
+            response = self.post('/agent/run', dict(material_id=mid))
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(self.sql('SELECT COUNT(*) AS count FROM questions')[0]['count'], 0)
+
+    def test_agent_answers_from_material_and_observes_answer(self):
+        mid = self.material()
+        response = self.post('/agent/run', dict(material_id=mid, task='qa', goal='二分查找有什么前提？'))
+        self.assertEqual(response.status_code, 201, response.json)
+        self.assertEqual(response.json['result']['type'], 'qa')
+        self.assertIn('有序', response.json['result']['answer'])
+        self.assertEqual(response.json['agent']['tool_steps'], 1)
+        self.assertIn('answer', self.provider.agent_observations[-1])
+        self.assertNotIn('question', response.json)
+
+    def test_agent_generates_grounded_knowledge_graph(self):
+        mid = self.material()
+        response = self.post('/agent/run', dict(material_id=mid, task='knowledge_graph'))
+        self.assertEqual(response.status_code, 201, response.json)
+        graph = response.json['result']['graph']
+        self.assertEqual(response.json['result']['type'], 'knowledge_graph')
+        self.assertEqual(len(graph['nodes']), 2)
+        self.assertEqual(graph['edges'][0]['relation'], '要求')
+        self.assertIn('graph', self.provider.agent_observations[-1])
+
+    def test_direct_material_qa_and_graph_endpoints(self):
+        mid = self.material()
+        answer = self.post(f'/materials/{mid}/ask', {'question': '二分查找的前提是什么？'})
+        graph = self.post(f'/materials/{mid}/knowledge-graph', {'focus': '算法前提'})
+        self.assertEqual(answer.status_code, 200)
+        self.assertEqual(answer.json['source_refs'][0]['chunk_id'], 1)
+        self.assertEqual(graph.status_code, 200)
+        self.assertEqual(graph.json['graph']['nodes'][0]['id'], 'binary-search')
 
     def test_login_timestamp_only_changes_on_successful_login(self):
         before = self.sql('SELECT * FROM users')[0]

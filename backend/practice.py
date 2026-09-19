@@ -12,6 +12,7 @@ from flask import Blueprint, current_app, g, jsonify, request, session
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from backend.database import get_db, init_db, transaction, utcnow
+from backend.study_agent import AgentLoopError, run_study_agent
 
 bp = Blueprint('practice', __name__, url_prefix='/api')
 CONFIDENCES = {'high', 'medium', 'low', 'unknown'}
@@ -143,6 +144,7 @@ def init_app(app, learning_provider=None):
     app.config.setdefault('STORAGE_ROOT', str(root))
     app.config.setdefault('DATABASE', str(Path(app.config['STORAGE_ROOT']) / 'ctrlpass.sqlite3'))
     app.config.setdefault('QUESTION_CACHE_SECONDS', 86400)
+    app.config.setdefault('AGENT_MAX_TOOL_STEPS', 4)
     app.config.setdefault('MAX_CONTENT_LENGTH', 32 * 1024 * 1024)
     if app.config['MAX_CONTENT_LENGTH'] is None:
         app.config['MAX_CONTENT_LENGTH'] = 32 * 1024 * 1024
@@ -336,6 +338,7 @@ def rename_point(material_id, point_id):
 
 def history_context(material_id):
     rows = get_db().execute('''SELECT a.id,a.answer_summary,a.score,a.grading_confidence,q.question_summary,q.difficulty_level,
+     q.primary_knowledge_point_id,q.question_type,
      (SELECT COUNT(*) FROM hint_records h WHERE h.attempt_id=a.id AND h.status='viewed' AND h.hint_type!='answer') AS hint_count,
      (SELECT COUNT(*) FROM hint_records h WHERE h.attempt_id=a.id AND h.status='viewed' AND h.hint_type='answer') AS answer_view_count
      FROM question_attempts a JOIN questions q ON q.id=a.question_id
@@ -343,7 +346,7 @@ def history_context(material_id):
     history = []
     for row in rows:
         item = dict(row)
-        item['errors'] = [dict(e) for e in get_db().execute("SELECT error_type,description,confidence,review_status FROM error_records WHERE attempt_id=? AND review_status!='rejected'", (row['id'],))]
+        item['errors'] = [dict(e) for e in get_db().execute("SELECT knowledge_point_id,error_type,description,confidence,review_status FROM error_records WHERE attempt_id=? AND review_status!='rejected'", (row['id'],))]
         history.append(item)
     return history
 
@@ -376,23 +379,17 @@ def validate_snapshot(raw, question_type):
     return dict(question=question, options=options, answer=answer, scoring_rubric=rubric)
 
 
-@bp.post('/questions/generate')
-def generate():
-    data = body()
-    expire_caches(g.user['id'])
-    material = owned('learning_materials', integer(data.get('material_id'), '资料编号', 1))
-    if material['status'] != 'ready':
-        raise APIError('资料尚未处理完成。', 409)
+def create_question(material, kp, qtype, difficulty, goal, context_extra=None):
+    """Generate, validate and persist one question for manual or agent mode."""
     points = json.loads(material['knowledge_points_json'])
-    kp = integer(data.get('primary_knowledge_point_id'), '知识点编号', 1)
-    if kp not in {p['id'] for p in points}:
-        raise APIError('知识点不属于该资料。')
-    qtype = data.get('question_type', 'single_choice')
-    if not isinstance(qtype, str) or qtype not in QUESTION_TYPES:
-        raise APIError('题型无效。')
-    difficulty = integer(data.get('difficulty_level', 3), '预计难度', 1, 5)
-    context = dict(goal=string(data.get('goal') or '巩固当前知识点', '出题目标', 500), history=history_context(material['id']), requested_difficulty=difficulty,
-                   adjustment_reason='按用户选择的预计难度出题，历史摘要用于选择考查方式；不因低可信度错因大幅调整难度。')
+    context = dict(
+        goal=goal,
+        history=history_context(material['id']),
+        requested_difficulty=difficulty,
+        adjustment_reason='结合学习历史选择考查方式；不因低可信度错因大幅调整难度。',
+    )
+    if context_extra:
+        context.update(context_extra)
     try:
         raw = provider().generate(material, kp, qtype, difficulty, context, storage_path(''))
         snapshot = validate_snapshot(raw, qtype)
@@ -416,7 +413,211 @@ def generate():
         path = storage_path(f'cache/questions/{qid}.json')
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(dump(snapshot), encoding='utf-8')
-    return jsonify(question=public_question(owned('questions', qid))), 201
+    return public_question(owned('questions', qid))
+
+
+@bp.post('/questions/generate')
+def generate():
+    data = body()
+    expire_caches(g.user['id'])
+    material = owned('learning_materials', integer(data.get('material_id'), '资料编号', 1))
+    if material['status'] != 'ready':
+        raise APIError('资料尚未处理完成。', 409)
+    points = json.loads(material['knowledge_points_json'])
+    kp = integer(data.get('primary_knowledge_point_id'), '知识点编号', 1)
+    if kp not in {p['id'] for p in points}:
+        raise APIError('知识点不属于该资料。')
+    qtype = data.get('question_type', 'single_choice')
+    if not isinstance(qtype, str) or qtype not in QUESTION_TYPES:
+        raise APIError('题型无效。')
+    difficulty = integer(data.get('difficulty_level', 3), '预计难度', 1, 5)
+    goal = string(data.get('goal') or '巩固当前知识点', '出题目标', 500)
+    return jsonify(question=create_question(material, kp, qtype, difficulty, goal)), 201
+
+
+def learning_stats(points, history):
+    """Build deterministic evidence that the agent can inspect as a tool result."""
+    stats = {point['id']: {
+        'knowledge_point_id': point['id'],
+        'name': point['name'],
+        'attempt_count': 0,
+        'average_score': None,
+        'latest_score': None,
+        'confirmed_error_count': 0,
+    } for point in points}
+    scores = {point['id']: [] for point in points}
+    for attempt in history:
+        point_id = attempt['primary_knowledge_point_id']
+        if point_id not in stats:
+            continue
+        stats[point_id]['attempt_count'] += 1
+        if attempt['score'] is not None:
+            scores[point_id].append(attempt['score'])
+            if stats[point_id]['latest_score'] is None:
+                stats[point_id]['latest_score'] = attempt['score']
+        for error in attempt['errors']:
+            error_point = error.get('knowledge_point_id')
+            if error_point in stats and error.get('review_status') == 'confirmed':
+                stats[error_point]['confirmed_error_count'] += 1
+    for point_id, values in scores.items():
+        if values:
+            stats[point_id]['average_score'] = round(sum(values) / len(values), 3)
+    return list(stats.values())
+
+
+@bp.post('/agent/run')
+def run_agent():
+    """Let the model observe, choose tools and re-observe until it has a result."""
+    data = body()
+    expire_caches(g.user['id'])
+    material = owned('learning_materials', integer(data.get('material_id'), '资料编号', 1))
+    if material['status'] != 'ready':
+        raise APIError('资料尚未处理完成。', 409)
+    task = data.get('task', 'auto')
+    if task not in ('auto', 'practice', 'qa', 'knowledge_graph'):
+        raise APIError('Agent 任务类型无效。')
+    defaults = {
+        'auto': '根据资料和学习记录选择最合适的下一项学习任务',
+        'practice': '根据我的学习记录安排下一道练习题',
+        'qa': '概括这份资料的核心内容',
+        'knowledge_graph': '生成整份资料的核心知识图谱',
+    }
+    goal = string(data.get('goal') or defaults[task], '学习目标或问题', 1000)
+    points = json.loads(material['knowledge_points_json'])
+    history = history_context(material['id'])
+    completed = {}
+    base_observation = {
+        'material': {'id': material['id'], 'name': material['original_filename']},
+        'knowledge_points': points,
+        'recent_history': history,
+        'requested_task': task,
+    }
+
+    def observe_agent(state):
+        # Every turn re-reads the stable context and includes the newest tool result.
+        return base_observation | state.get('last_tool_result', {})
+
+    def decide_agent(state):
+        return provider().decide_next(
+            goal,
+            state['observation'],
+            state.get('trace', []),
+            'result' in state,
+        )
+
+    def inspect_history(_arguments):
+        return {'point_stats': learning_stats(points, history)}
+
+    def generate_practice(arguments):
+        if 'practice' in completed:
+            return completed['practice'] | {'reused': True}
+        kp = arguments.get('primary_knowledge_point_id')
+        qtype = arguments.get('question_type')
+        difficulty = arguments.get('difficulty_level')
+        focus = arguments.get('focus') or goal
+        if type(kp) is not int or kp not in {point['id'] for point in points}:
+            raise AgentLoopError('Agent selected an invalid knowledge point')
+        if not isinstance(qtype, str) or qtype not in QUESTION_TYPES:
+            raise AgentLoopError('Agent selected an invalid question type')
+        if type(difficulty) is not int or not 1 <= difficulty <= 5:
+            raise AgentLoopError('Agent selected an invalid difficulty')
+        if not isinstance(focus, str) or not focus.strip() or len(focus) > 500:
+            raise AgentLoopError('Agent selected an invalid practice focus')
+        question = create_question(
+            material,
+            kp,
+            qtype,
+            difficulty,
+            focus.strip(),
+            context_extra={'agent_mode': True, 'agent_goal': goal},
+        )
+        completed['practice'] = {'type': 'practice', 'question': question}
+        return completed['practice'] | {'reused': False}
+
+    def answer_from_material(arguments):
+        if 'qa' in completed:
+            return completed['qa'] | {'reused': True}
+        question = arguments.get('question') or goal
+        if not isinstance(question, str) or not question.strip() or len(question) > 1000:
+            raise AgentLoopError('Agent produced an invalid material question')
+        answer = provider().answer(material, question.strip(), storage_path(''))
+        completed['qa'] = {'type': 'qa', **answer}
+        return completed['qa'] | {'reused': False}
+
+    def generate_graph(arguments):
+        if 'knowledge_graph' in completed:
+            return completed['knowledge_graph'] | {'reused': True}
+        focus = arguments.get('focus') or goal
+        if not isinstance(focus, str) or not focus.strip() or len(focus) > 1000:
+            raise AgentLoopError('Agent produced an invalid graph focus')
+        graph = provider().knowledge_graph(material, focus.strip(), storage_path(''))
+        completed['knowledge_graph'] = {'type': 'knowledge_graph', 'graph': graph}
+        return completed['knowledge_graph'] | {'reused': False}
+
+    try:
+        result = run_study_agent(
+            goal,
+            observe_agent,
+            decide_agent,
+            {
+                'inspect_learning_history': inspect_history,
+                'generate_practice_question': generate_practice,
+                'answer_from_material': answer_from_material,
+                'generate_knowledge_graph': generate_graph,
+            },
+            result_actions={'generate_practice_question', 'answer_from_material', 'generate_knowledge_graph'},
+            max_tool_steps=current_app.config['AGENT_MAX_TOOL_STEPS'],
+        )
+    except APIError:
+        raise
+    except AgentLoopError as exc:
+        current_app.logger.warning('Study agent stopped: %s', exc)
+        raise APIError(f'学习 Agent 未能完成任务：{exc}', 502)
+    except Exception:
+        current_app.logger.exception('Study agent failed')
+        raise APIError('学习 Agent 运行失败，请检查模型服务后重试。', 502)
+    output = result['result']
+    response = {
+        'result': output,
+        'agent': {
+            'goal': goal,
+            'message': result['final_message'],
+            'tool_steps': result['tool_steps'],
+            'trace': result['trace'],
+        },
+    }
+    if output['type'] == 'practice':
+        response['question'] = output['question']
+    return jsonify(response), 201
+
+
+@bp.post('/materials/<int:material_id>/ask')
+def ask_material(material_id):
+    data = body()
+    material = owned('learning_materials', material_id)
+    if material['status'] != 'ready':
+        raise APIError('资料尚未处理完成。', 409)
+    question = string(data.get('question'), '问题', 1000)
+    try:
+        return jsonify(provider().answer(material, question, storage_path('')))
+    except Exception:
+        current_app.logger.exception('Material question answering failed')
+        raise APIError('资料问答失败，请检查模型服务后重试。', 502)
+
+
+@bp.post('/materials/<int:material_id>/knowledge-graph')
+def material_knowledge_graph(material_id):
+    data = body()
+    material = owned('learning_materials', material_id)
+    if material['status'] != 'ready':
+        raise APIError('资料尚未处理完成。', 409)
+    focus = data.get('focus') or '整份资料的核心概念与关系'
+    focus = string(focus, '知识图谱范围', 1000)
+    try:
+        return jsonify(graph=provider().knowledge_graph(material, focus, storage_path('')))
+    except Exception:
+        current_app.logger.exception('Knowledge graph generation failed')
+        raise APIError('知识图谱生成失败，请检查模型服务后重试。', 502)
 
 
 @bp.get('/questions/<int:question_id>')

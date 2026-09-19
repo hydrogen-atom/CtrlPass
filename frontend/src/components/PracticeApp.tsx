@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { call, labels, messageOf, RequestError, requestKey } from '../api/practice';
-import type { Attempt, Detail, ErrorRecord, Hint, Material, Point, Progress, Question, User } from '../api/practice';
+import type { AgentOutput, AgentResult, Attempt, Detail, ErrorRecord, Hint, KnowledgeGraph, Material, Progress, User } from '../api/practice';
 import './PracticeApp.css';
 
 const duration = (ms: number) => `${Math.floor(ms / 60000)} 分 ${Math.floor(ms / 1000) % 60} 秒`;
@@ -32,6 +32,22 @@ function Auth({ onLogin }: { onLogin: (user: User) => void }) {
     <button type="button" className="secondary" disabled={busy} onClick={() => setRegister(!register)}>{register ? '已有账号，去登录' : '没有账号，创建账号'}</button>
     <small>这里使用独立学习账号，暂未连接 WebForms 账号。</small>
   </form>;
+}
+
+function KnowledgeGraphView({ graph }: { graph: KnowledgeGraph }) {
+  const width = 760; const height = 430; const radius = Math.min(165, 28 + graph.nodes.length * 8);
+  const positions = new Map(graph.nodes.map((node, index) => {
+    const angle = (Math.PI * 2 * index / graph.nodes.length) - Math.PI / 2;
+    return [node.id, { x: width / 2 + Math.cos(angle) * radius, y: height / 2 + Math.sin(angle) * radius }];
+  }));
+  return <div className="study-graph">
+    <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`知识图谱：${graph.nodes.length} 个节点，${graph.edges.length} 条关系`}>
+      <defs><marker id="study-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" /></marker></defs>
+      {graph.edges.map((edge, index) => { const from = positions.get(edge.source); const to = positions.get(edge.target); return from && to ? <g key={`${edge.source}-${edge.target}-${index}`}><line x1={from.x} y1={from.y} x2={to.x} y2={to.y} markerEnd="url(#study-arrow)" /><text x={(from.x + to.x) / 2} y={(from.y + to.y) / 2 - 5}>{edge.relation.slice(0, 12)}</text></g> : null; })}
+      {graph.nodes.map(node => { const position = positions.get(node.id)!; return <g className="study-graph-node" key={node.id} transform={`translate(${position.x} ${position.y})`}><circle r="37" /><text textAnchor="middle" y="4">{node.label.length > 10 ? `${node.label.slice(0, 9)}…` : node.label}</text><title>{node.label}：{node.description}</title></g>; })}
+    </svg>
+    <div className="study-graph-relations">{graph.edges.map((edge, index) => <p key={`${edge.source}-${edge.target}-${index}`}><strong>{graph.nodes.find(node => node.id === edge.source)?.label}</strong> —{edge.relation}→ <strong>{graph.nodes.find(node => node.id === edge.target)?.label}</strong>{edge.evidence && <small>{edge.evidence}</small>}</p>)}</div>
+  </div>;
 }
 
 function AttemptView({ initial, onChanged, onClose }: { initial: Detail; onChanged: () => void; onClose: () => void }) {
@@ -221,82 +237,136 @@ function AttemptView({ initial, onChanged, onClose }: { initial: Detail; onChang
   </section>;
 }
 
-function Workspace() {
+interface ChatMessage {
+  id: string;
+  role: 'user' | 'assistant';
+  text?: string;
+  output?: AgentOutput;
+  agent?: AgentResult;
+}
+
+const taskOptions = [
+  { value: 'auto', label: '自动', icon: '✦' },
+  { value: 'qa', label: '问答', icon: '问' },
+  { value: 'knowledge_graph', label: '图谱', icon: '图' },
+  { value: 'practice', label: '练习', icon: '练' },
+];
+
+function Workspace({ user, onLogout }: { user: User; onLogout: () => void }) {
   const [materials, setMaterials] = useState<Material[]>([]);
   const [history, setHistory] = useState<Attempt[]>([]);
   const [selected, setSelected] = useState(0);
-  const [point, setPoint] = useState(0);
-  const [type, setType] = useState('single_choice');
-  const [difficulty, setDifficulty] = useState(3);
-  const [goal, setGoal] = useState('');
+  const [prompt, setPrompt] = useState('');
   const [detail, setDetail] = useState<Detail | null>(null);
-  const [generated, setGenerated] = useState<Question | null>(null);
+  const [agentTask, setAgentTask] = useState('auto');
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
-  const [offset, setOffset] = useState(0);
-  const [chunkSize, setChunkSize] = useState(500);
-  const [overlap, setOverlap] = useState(100);
-  const [modelSplit, setModelSplit] = useState(false);
+  const conversationEnd = useRef<HTMLDivElement>(null);
   const refresh = useCallback(async () => {
-    const [m, a] = await loadWorkspace(offset);
+    const [m, a] = await loadWorkspace(0);
     setMaterials(m.materials); setHistory(a.attempts);
-  }, [offset]);
+    setSelected(current => current || m.materials.find(item => item.status === 'ready')?.id || m.materials[0]?.id || 0);
+  }, []);
   useEffect(() => {
     let cancelled = false;
-    void loadWorkspace(offset).then(([m, a]) => {
-      if (!cancelled) { setMaterials(m.materials); setHistory(a.attempts); }
+    void loadWorkspace(0).then(([m, a]) => {
+      if (!cancelled) {
+        setMaterials(m.materials); setHistory(a.attempts);
+        setSelected(m.materials.find(item => item.status === 'ready')?.id || m.materials[0]?.id || 0);
+      }
     }).catch(e => { if (!cancelled) setError(messageOf(e)); });
     return () => { cancelled = true; };
-  }, [offset]);
+  }, []);
+  useEffect(() => { conversationEnd.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages, busy]);
   const material = materials.find(m => m.id === selected);
-  const points: Point[] = material ? JSON.parse(material.knowledge_points_json) : [];
-  const run = async (work: () => Promise<void>) => {
-    setBusy(true); setError(''); setNotice('');
-    try { await work(); } catch (e) { setError(messageOf(e)); } finally { setBusy(false); }
-  };
   const start = async (qid: number) => {
+    setBusy(true); setError('');
+    try {
     const result = await call<{ attempt: Attempt }>(`/questions/${qid}/attempts`, 'POST', { is_page_hidden: Number(document.hidden) });
-    setDetail(await call<Detail>(`/attempts/${result.attempt.id}`)); setGenerated(null); await refresh();
+      setDetail(await call<Detail>(`/attempts/${result.attempt.id}`)); await refresh();
+    } catch (e) { setError(messageOf(e)); } finally { setBusy(false); }
   };
+
+  const sendMessage = async (task = agentTask, text = prompt) => {
+    if (!material || material.status !== 'ready' || busy) return;
+    const fallbacks: Record<string, string> = {
+      auto: '请根据这份资料安排最合适的学习任务', qa: '请总结这份资料的核心内容',
+      knowledge_graph: '请生成这份资料的核心知识图谱', practice: '请根据我的学习记录安排一道练习题',
+    };
+    const content = text.trim() || fallbacks[task];
+    const userMessage: ChatMessage = { id: `user-${Date.now()}`, role: 'user', text: content };
+    setMessages(current => [...current, userMessage]); setPrompt(''); setBusy(true); setError(''); setNotice('');
+    try {
+      const response = await call<{ result: AgentOutput; agent: AgentResult }>('/agent/run', 'POST', {
+        material_id: material.id, task, goal: content,
+      });
+      setMessages(current => [...current, { id: `assistant-${Date.now()}`, role: 'assistant', output: response.result, agent: response.agent }]);
+      await refresh();
+    } catch (e) { setError(messageOf(e)); } finally { setBusy(false); }
+  };
+
+  const upload = async (file: File) => {
+    setBusy(true); setError(''); setNotice('正在上传并处理资料…');
+    try {
+      const form = new FormData(); form.append('file', file);
+      const uploaded = await call<{ material: Material }>('/materials/upload', 'POST', form);
+      setSelected(uploaded.material.id); setMessages([]);
+      await call(`/materials/${uploaded.material.id}/process`, 'POST', { chunk_size: 500, chunk_overlap: 100, use_model_splitter: false });
+      await refresh(); setNotice(`“${uploaded.material.original_filename}”已准备好，可以开始提问。`);
+    } catch (e) { setError(messageOf(e)); } finally { setBusy(false); }
+  };
+
+  const processSelected = async () => {
+    if (!material) return;
+    setBusy(true); setError(''); setNotice('正在处理资料…');
+    try {
+      await call(`/materials/${material.id}/process`, 'POST', { chunk_size: 500, chunk_overlap: 100, use_model_splitter: false });
+      await refresh(); setNotice('资料已准备好，可以开始对话。');
+    } catch (e) { setError(messageOf(e)); } finally { setBusy(false); }
+  };
+
   if (detail) return <AttemptView key={detail.attempt.id} initial={detail} onChanged={() => { void refresh().catch(e => setError(messageOf(e))); }} onClose={() => setDetail(null)} />;
-  return <>
-    <div className="study-grid"><section className="study-card"><h2>1 · 学习资料</h2>
-      <label>上传资料<input type="file" accept=".txt,.pdf,.docx" disabled={busy} onChange={event => {
-        const file = event.target.files?.[0]; event.target.value = ''; if (!file) return;
-        void run(async () => {
-          const form = new FormData(); form.append('file', file);
-          const result = await call<{ material: Material; duplicate_material_id: number | null }>('/materials/upload', 'POST', form);
-          setSelected(result.material.id); setPoint(0); await refresh();
-          setNotice(result.duplicate_material_id ? `已上传，内容与资料 ${result.duplicate_material_id} 相同。` : '已上传，请处理资料。');
-        });
-      }} /></label>
-      <label>选择资料<select value={selected} onChange={e => { setSelected(Number(e.target.value)); setPoint(0); }}><option value={0}>请选择</option>{materials.map(m => <option key={m.id} value={m.id}>{m.original_filename} · {labels[m.status]}</option>)}</select></label>
-      {material && <p>{labels[material.status]} · {material.chunk_count} 个文本片段 {material.error_message}</p>}
-      <div className="study-row"><label>分段大小<input type="number" min={100} max={10000} value={chunkSize} onChange={e => setChunkSize(Number(e.target.value))} /></label><label>重叠长度<input type="number" min={0} max={chunkSize - 1} value={overlap} onChange={e => setOverlap(Number(e.target.value))} /></label></div>
-      <label className="study-option"><input type="checkbox" checked={modelSplit} onChange={e => setModelSplit(e.target.checked)} />按语义分段</label>
-      <button disabled={busy || !material || ['ready', 'processing'].includes(material.status)} onClick={() => void run(async () => {
-        await call(`/materials/${selected}/process`, 'POST', { chunk_size: chunkSize, chunk_overlap: overlap, use_model_splitter: modelSplit }); await refresh(); setNotice('资料已可使用。');
-      })}>{busy ? '处理中…' : '处理资料'}</button>
-      <button className="secondary" disabled={busy} onClick={() => void run(refresh)}>刷新资料与记录</button>
-    </section>
-    <section className="study-card"><h2>2 · 生成练习</h2>
-      <label>知识点<select value={point} onChange={e => setPoint(Number(e.target.value))}><option value={0}>请选择知识点</option>{points.map(p => <option value={p.id} key={p.id}>{p.name}</option>)}</select></label>
-      <div className="study-row"><label>题型<select value={type} onChange={e => setType(e.target.value)}>{['single_choice', 'multiple_choice', 'fill_blank', 'short_answer'].map(t => <option key={t} value={t}>{labels[t]}</option>)}</select></label><label>预计难度<select value={difficulty} onChange={e => setDifficulty(Number(e.target.value))}>{[1, 2, 3, 4, 5].map(n => <option key={n} value={n}>{n}</option>)}</select></label></div>
-      <label>出题目标<input value={goal} maxLength={500} onChange={e => setGoal(e.target.value)} placeholder="例如：练习边界条件的应用" /></label>
-      <p className="study-meta">出题会参考你的历史摘要。难度为模型估计值。</p>
-      <button disabled={busy || material?.status !== 'ready' || !point} onClick={() => void run(async () => {
-        const result = await call<{ question: Question }>('/questions/generate', 'POST', { material_id: selected, primary_knowledge_point_id: point, question_type: type, difficulty_level: difficulty, goal: goal || undefined }); setGenerated(result.question);
-      })}>{busy ? '请稍候…' : '生成题目'}</button>
-    </section></div>
-    {error && <p role="alert" className="study-error">{error}</p>}{notice && <p role="status" className="study-notice">{notice}</p>}
-    {generated && <section className="study-card"><h2>准备好开始了吗</h2><p className="study-question">{generated.question}</p><button disabled={busy} onClick={() => void run(() => start(generated.id))}>开始作答</button><small>开始后计时；提交有效答案时才保存完整原题。</small></section>}
-    <section className="study-card"><h2>3 · 作答历史</h2><p className="study-meta">时间按本地时区显示。重做会新增一次记录。</p>
-      {!history.length && <p>还没有作答记录，先选择资料生成一道题。</p>}
-      {history.map(a => <article className="study-history" key={a.id}><div><strong>{a.question_summary}</strong><p>{new Date(a.started_at).toLocaleString()} · 第 {a.attempt_no} 次 · {labels[a.status]}</p><small>{duration(a.active_duration_ms)} · 提示 {a.hint_count || 0} 次 · 查看答案 {a.answer_view_count || 0} 次{a.score !== null ? ` · 得分 ${Math.round(a.score * 100)}%` : ''}</small></div><div className="study-row"><button className="secondary" disabled={busy} onClick={() => void run(async () => { setDetail(await call<Detail>(`/attempts/${a.id}`)); })}>{a.status === 'in_progress' ? '继续作答' : '查看记录'}</button>{a.status !== 'in_progress' && a.status !== 'expired' && <button disabled={busy} className="secondary" onClick={() => void run(() => start(a.question_id))}>重做</button>}</div></article>)}
-      <div className="study-row"><button className="secondary" disabled={busy || !offset} onClick={() => setOffset(Math.max(0, offset - 50))}>上一页</button><button className="secondary" disabled={busy || history.length < 50} onClick={() => setOffset(offset + 50)}>下一页</button></div>
-    </section>
-  </>;
+  return <div className="chat-shell">
+    <aside className="chat-sidebar">
+      <div className="chat-brand"><span className="chat-brand-mark">C</span><div><strong>CtrlPass</strong><small>资料学习助手</small></div></div>
+      <label className={`chat-upload ${busy ? 'disabled' : ''}`}>＋ 上传资料<input type="file" accept=".txt,.pdf,.docx" disabled={busy} onChange={event => { const file = event.target.files?.[0]; event.target.value = ''; if (file) void upload(file); }} /></label>
+      <div className="chat-sidebar-section"><p className="chat-sidebar-title">学习资料</p><div className="chat-materials">
+        {!materials.length && <small>上传 TXT、PDF 或 DOCX 开始学习</small>}
+        {materials.map(item => <button className={item.id === selected ? 'active' : ''} key={item.id} onClick={() => { setSelected(item.id); setMessages([]); setError(''); setNotice(''); }}><span>{item.original_filename}</span><small><i className={`status-dot ${item.status}`} />{labels[item.status]}</small></button>)}
+      </div></div>
+      <div className="chat-sidebar-section chat-history-list"><p className="chat-sidebar-title">最近练习</p>
+        {!history.length && <small>暂无练习记录</small>}
+        {history.slice(0, 8).map(attempt => <button key={attempt.id} onClick={() => void call<Detail>(`/attempts/${attempt.id}`).then(setDetail).catch(e => setError(messageOf(e)))}><span>{attempt.question_summary}</span><small>{labels[attempt.status]}{attempt.score !== null ? ` · ${Math.round(attempt.score * 100)}分` : ''}</small></button>)}
+      </div>
+      <div className="chat-account"><div className="chat-avatar">{user.display_name.slice(0, 1).toUpperCase()}</div><span>{user.display_name}</span><button onClick={onLogout} aria-label="退出登录">退出</button></div>
+    </aside>
+    <main className="chat-main">
+      <header className="chat-topbar"><div><strong>{material?.original_filename || '请选择学习资料'}</strong>{material && <small>{material.chunk_count} 个片段 · {labels[material.status]}</small>}</div><div className="chat-mobile-actions"><select aria-label="选择资料" value={selected} onChange={event => { setSelected(Number(event.target.value)); setMessages([]); }}><option value={0}>选择资料</option>{materials.map(item => <option key={item.id} value={item.id}>{item.original_filename}</option>)}</select><label aria-label="上传资料">＋<input type="file" accept=".txt,.pdf,.docx" disabled={busy} onChange={event => { const file = event.target.files?.[0]; event.target.value = ''; if (file) void upload(file); }} /></label><select aria-label="最近练习" value="" onChange={event => { const attemptId = Number(event.target.value); if (attemptId) void call<Detail>(`/attempts/${attemptId}`).then(setDetail).catch(e => setError(messageOf(e))); }}><option value="">历史</option>{history.slice(0, 8).map(attempt => <option key={attempt.id} value={attempt.id}>{attempt.question_summary}</option>)}</select><button onClick={onLogout}>退出</button></div></header>
+      <div className="chat-conversation">
+        {!material && <div className="chat-empty"><div className="chat-empty-mark">C</div><h1>从一份资料开始</h1><p>上传文档后，可以直接提问、生成知识图谱或安排练习。</p></div>}
+        {material && !messages.length && <div className="chat-empty"><div className="chat-empty-mark">✦</div><h1>想从这份资料学什么？</h1><p>直接输入问题，或者选择下面的常用功能。</p><div className="chat-suggestions"><button onClick={() => void sendMessage('qa', '请总结这份资料的核心内容')}>总结核心内容<span>→</span></button><button onClick={() => void sendMessage('knowledge_graph', '生成整份资料的核心知识图谱')}>生成知识图谱<span>→</span></button><button onClick={() => void sendMessage('practice', '根据我的学习记录安排一道练习题')}>安排一次练习<span>→</span></button></div></div>}
+        {messages.map(message => message.role === 'user' ? <article className="chat-message user" key={message.id}><div className="chat-bubble">{message.text}</div></article> : <article className="chat-message assistant" key={message.id}><div className="chat-assistant-mark">C</div><div className="chat-response">
+          {message.agent && <p className="chat-result-title">{message.agent.message}</p>}
+          {message.text && <p>{message.text}</p>}
+          {message.output?.type === 'qa' && <><div className="study-answer">{message.output.answer}</div><div className="chat-sources">{message.output.source_refs.map(ref => <span key={`${ref.chunk_id}-${ref.page}`}>片段 {ref.chunk_id}{ref.page === null ? '' : ` · 第 ${ref.page} 页`}</span>)}</div></>}
+          {message.output?.type === 'knowledge_graph' && <><KnowledgeGraphView graph={message.output.graph} /><div className="chat-sources">{message.output.graph.source_refs.map(ref => <span key={`${ref.chunk_id}-${ref.page}`}>片段 {ref.chunk_id}{ref.page === null ? '' : ` · 第 ${ref.page} 页`}</span>)}</div></>}
+          {message.output?.type === 'practice' && <div className="chat-question-card"><span>{labels[message.output.question.question_type]} · 难度 {message.output.question.difficulty_level}/5</span><h3>{message.output.question.question}</h3><button disabled={busy} onClick={() => { if (message.output?.type === 'practice') void start(message.output.question.id); }}>开始作答</button></div>}
+          {message.agent && <details className="chat-trace"><summary>查看 Agent 执行过程 · {message.agent.tool_steps} 次工具调用</summary><ol>{message.agent.trace.map((event, index) => <li key={`${event.phase}-${event.step}-${index}`}>{event.summary}</li>)}</ol></details>}
+        </div></article>)}
+        {busy && <article className="chat-message assistant"><div className="chat-assistant-mark">C</div><div className="chat-thinking"><span /><span /><span /></div></article>}
+        <div ref={conversationEnd} />
+      </div>
+      <div className="chat-bottom">
+        {notice && <p role="status" className="chat-inline-notice">{notice}</p>}{error && <p role="alert" className="chat-inline-error">{error}</p>}
+        {material && material.status !== 'ready' && <button className="chat-process" disabled={busy || material.status === 'processing'} onClick={() => void processSelected()}>{material.status === 'processing' ? '资料处理中…' : '处理当前资料'}</button>}
+        <div className="chat-mode-tabs">{taskOptions.map(option => <button key={option.value} className={agentTask === option.value ? 'active' : ''} onClick={() => setAgentTask(option.value)}><span>{option.icon}</span>{option.label}</button>)}</div>
+        <div className="chat-composer"><textarea rows={1} value={prompt} maxLength={1000} disabled={busy || !material || material.status !== 'ready'} onChange={event => setPrompt(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void sendMessage(); } }} placeholder={!material ? '请先上传或选择资料' : material.status !== 'ready' ? '请先处理资料' : agentTask === 'qa' ? '针对资料提一个问题…' : agentTask === 'knowledge_graph' ? '描述希望梳理的知识范围…' : agentTask === 'practice' ? '描述想练习的内容、题型或难度…' : '向 CtrlPass 发送消息…'} /><button className="chat-send" aria-label="发送" disabled={busy || !material || material.status !== 'ready'} onClick={() => void sendMessage()}>↑</button></div>
+        <small className="chat-disclaimer">回答基于已上传资料生成，请结合引用片段核对。</small>
+      </div>
+    </main>
+  </div>;
 }
 
 export default function PracticeApp() {
@@ -314,9 +384,6 @@ export default function PracticeApp() {
   if (loading) return <p className="study-loading">正在读取账号…</p>;
   return <div className="study-app">
     {error && <p role="alert" className="study-error">{error}</p>}
-    {!user ? <Auth onLogin={u => { setUser(u); setError(''); }} /> : <>
-      <header className="study-header"><div><p className="study-eyebrow">CtrlPass</p><h1>每一次练习，都有记录</h1></div><div className="study-row"><span>{user.display_name}</span><button className="secondary" onClick={() => void call('/auth/logout', 'POST', {}).then(() => setUser(null)).catch(e => setError(messageOf(e)))}>退出</button></div></header>
-      <Workspace key={user.id} />
-    </>}
+    {!user ? <Auth onLogin={u => { setUser(u); setError(''); }} /> : <Workspace key={user.id} user={user} onLogout={() => void call('/auth/logout', 'POST', {}).then(() => setUser(null)).catch(e => setError(messageOf(e)))} />}
   </div>;
 }
