@@ -1,0 +1,18 @@
+langchain>=1.0.0
+langchain-community>=0.2.0
+langchain-text-splitters>=1.0.0
+langgraph>=1.2.0
+--find-links https://download.pytorch.org/whl/torch_stable.html
+faiss-cpu>=1.7.4
+sentence-transformers>=2.2.2
+python-docx>=1.0.1
+PyPDF2>=3.0.1
+transformers>=4.36.2
+torch>=2.2.1
+pyvis>=0.3.2
+docx2txt>=0.8
+requests>=2.31.0
+python-dotenv>=1.0.0
+dashscope>=1.10.0
+flake8>=6.1.0
+flask>=3.0.0
